@@ -767,7 +767,7 @@ def main():
             with open(output_file, "a") as f:
                 f.write("\n")  # separate from previous content
                 f.write("==== New Training Run ====\n")
-                f.write(f"optimizer_type: {args.optim_choice}\n")
+                f.write(f"optimizer_type: {args.optimizer}\n")
                 f.write(f"optimizer_lr: {args.optimizer_lr}\n")
                 f.write(f"optimizer_mom: {args.optimizer_mom}\n")
                 f.write(f"n_embd: {args.n_embd}\n")

@@ -16,7 +16,14 @@ Training code for studying learning rate transfer in GPT-2 style models, with su
 
 ## Environment
 
-To prepare the environment, simply run:
+First, create and activate a Python 3.12 conda environment:
+
+```shell
+conda create -n lr-transfer python=3.12 -y
+conda activate lr-transfer
+```
+
+Then install the dependencies:
 
 ```shell
 pip install -r requirements.txt
