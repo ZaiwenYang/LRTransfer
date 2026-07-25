@@ -188,6 +188,8 @@ def parse_args():
                         help='how many tokens of validation data?')
     parser.add_argument('--save_every', type=int, default=250,
                         help='every how many steps to save the checkpoint? 0 for only at the end')
+    parser.add_argument('--log_root', type=str, default='logs',
+                        help='directory for run outputs (checkpoints go to <log_root>/models)')
     
     # Wandb arguments
     parser.add_argument('--use_wandb', type=bool, default=False,
@@ -364,7 +366,7 @@ def main():
     logfile = None
     if master_process:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        logdir = 'logs/%s/' % run_id
+        logdir = args.log_root
         modeldir = os.path.join(logdir, 'models')
         os.makedirs(logdir, exist_ok=True)
         os.makedirs(modeldir, exist_ok=True)
