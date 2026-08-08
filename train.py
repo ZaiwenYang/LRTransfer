@@ -28,6 +28,7 @@ import socket
 
 # Import our modules
 from models.nanoGPT import GPT, GPTConfig
+from models.weight_norms import load_target_norms
 from optim.muon import Muon
 from optim.adamh import AdamH
 
@@ -180,6 +181,8 @@ def parse_args():
                         help='number of attention heads')
     parser.add_argument('--n_embd', type=int, default=768,
                         help='embedding dimension')
+    parser.add_argument('--target_norms', type=str, default=None,
+                        help='optional JSON file containing initialization weight norms')
     
     # Evaluation and logging hyperparameters
     parser.add_argument('--val_loss_every', type=int, default=125,
@@ -262,6 +265,12 @@ def optim_choice():
 
 def main():
     args = parse_args()
+    if args.target_norms is not None and args.resume_ckpt is not None:
+        raise ValueError(
+            "--target_norms only applies to fresh initialization and cannot be "
+            "combined with --resume_ckpt"
+        )
+
     if args.use_power_learning_rate:
         print("Using 2-power learning rate for optimizers")
         args.optimizer_lr = 2 ** (-args.optimizer_lr)
@@ -302,7 +311,16 @@ def main():
         n_head=args.n_head,
         n_embd=args.n_embd
     )
-    model = GPT(model_config)
+    target_weight_norms = None
+    if args.target_norms is not None:
+        target_weight_norms = load_target_norms(args.target_norms, model_config)
+        if master_process:
+            print(
+                f"Loaded target initialization norms for "
+                f"{len(target_weight_norms)} parameters from {args.target_norms}"
+            )
+
+    model = GPT(model_config, target_weight_norms=target_weight_norms)
     model = model.cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -389,6 +407,7 @@ def main():
             'n_layer': args.n_layer,
             'n_head': args.n_head,
             'n_embd': args.n_embd,
+            'target_norms': args.target_norms,
             'grad_clip': args.grad_clip,
         }
         config_path = os.path.join(logdir, 'config.yaml')
@@ -883,4 +902,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

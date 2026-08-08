@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import math
 
+from models.weight_norms import validate_target_norms
+
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
@@ -102,7 +104,7 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, target_weight_norms=None):
         super().__init__()
         self.config = config
 
@@ -118,6 +120,58 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        # Target norms must be applied after every standard and special init.
+        if target_weight_norms is not None:
+            self.set_weight_norms_(target_weight_norms)
+
+    @torch.no_grad()
+    def set_weight_norms_(self, target_weight_norms):
+        """Rescale each unique parameter to its requested whole-tensor norm."""
+        target_weight_norms = validate_target_norms(target_weight_norms)
+        parameters = dict(self.named_parameters())
+
+        unknown = sorted(set(target_weight_norms) - set(parameters))
+        missing = sorted(set(parameters) - set(target_weight_norms))
+        if unknown or missing:
+            details = []
+            if unknown:
+                details.append(
+                    "Unknown target-norm parameters:\n" + "\n".join(unknown)
+                )
+            if missing:
+                details.append(
+                    "Missing target norms for model parameters:\n"
+                    + "\n".join(missing)
+                )
+            raise KeyError("\n\n".join(details))
+
+        plans = []
+        for name, parameter in parameters.items():
+            if not parameter.is_floating_point():
+                raise TypeError(f"Cannot normalize non-floating parameter {name}")
+
+            current_norm = parameter.detach().float().norm().item()
+            if current_norm == 0:
+                raise ValueError(
+                    f"Cannot normalize zero-initialized parameter {name}"
+                )
+
+            plans.append(
+                (name, parameter, target_weight_norms[name], current_norm)
+            )
+
+        # Do not modify any parameter until the complete request is validated.
+        for _, parameter, target_norm, current_norm in plans:
+            parameter.mul_(target_norm / current_norm)
+
+        for name, parameter, target_norm, _ in plans:
+            achieved = parameter.detach().float().norm().item()
+            if not math.isclose(achieved, target_norm, rel_tol=1e-5, abs_tol=1e-6):
+                raise RuntimeError(
+                    f"Norm verification failed for {name}: "
+                    f"target={target_norm}, achieved={achieved}"
+                )
                 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

@@ -93,6 +93,7 @@ torchrun --standalone --nproc_per_node=8 train.py
 | `--n_layer` | `12` | Number of transformer layers |
 | `--n_head` | `6` | Number of attention heads |
 | `--n_embd` | `768` | Embedding dimension |
+| `--target_norms` | `None` | JSON file containing fresh-initialization weight norms |
 
 ### Evaluation & Logging
 
@@ -161,6 +162,39 @@ torchrun --standalone --nproc_per_node=8 train.py \
 ```shell
 torchrun --standalone --nproc_per_node=8 train.py \
     --resume_ckpt logs/20260101_120000/models/state_step001000.pt
+```
+
+### Initialize with Target Weight Norms
+
+The JSON file may include architecture metadata followed by the complete target
+table. Each value is the norm of one whole tensor:
+
+```json
+{
+  "metadata": {
+    "vocab_size": 50304,
+    "n_layer": 12,
+    "n_head": 4,
+    "n_embd": 512
+  },
+  "target_norms": {
+    "transformer.wte.weight": 574.3865,
+    "transformer.h.0.attn.c_q.weight": 31.3868
+  }
+}
+```
+
+The abbreviated table above is illustrative; the actual file must cover every
+unique trainable parameter. Do not add `lm_head.weight`, because it is tied to
+`transformer.wte.weight`. Target norms only apply to fresh initialization and
+cannot be combined with `--resume_ckpt`.
+
+```shell
+torchrun --standalone --nproc_per_node=8 train.py \
+    --n_layer 12 \
+    --n_head 4 \
+    --n_embd 512 \
+    --target_norms configs/target_norms_512.json
 ```
 
 ## Output Layout
