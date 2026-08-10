@@ -93,7 +93,7 @@ torchrun --standalone --nproc_per_node=8 train.py
 | `--n_layer` | `12` | Number of transformer layers |
 | `--n_head` | `6` | Number of attention heads |
 | `--n_embd` | `768` | Embedding dimension |
-| `--target_norms` | `None` | JSON file containing fresh-initialization weight norms |
+| `--target_norms` | `None` | JSON file containing initialization weight norms; applied after `--init_ckpt` when both are provided |
 
 ### Evaluation & Logging
 
@@ -106,13 +106,14 @@ torchrun --standalone --nproc_per_node=8 train.py
 | `--wandb_project` | `LRTransfer` | W&B project name |
 | `--wandb_run_name` | `gpt-2` | W&B run name (falls back to `run_id` if `None`) |
 
-### Backup & Resume
+### Backup & Checkpoints
 
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--enable_backup` | `False` | Copy logs and W&B run folder to `--backup_root` after training |
 | `--backup_root` | `logs` | Destination root for backups |
 | `--write_file` | `final_val_loss.txt` | Append the final validation loss to this file |
+| `--init_ckpt` | `None` | Path to a `.pt` checkpoint used only for initial model weights; training starts fresh at step 0 |
 | `--resume_ckpt` | `None` | Path to a `.pt` checkpoint to resume from (restores model, optimizers, and step) |
 
 ## Example Commands
@@ -164,6 +165,18 @@ torchrun --standalone --nproc_per_node=8 train.py \
     --resume_ckpt logs/20260101_120000/models/state_step001000.pt
 ```
 
+### Initialize a Fresh Run from Checkpoint Weights
+
+`--init_ckpt` loads only the checkpoint's model weights. The optimizer,
+learning-rate schedule, data position, and step are initialized as a fresh run.
+It cannot be combined with `--resume_ckpt`.
+
+```shell
+torchrun --standalone --nproc_per_node=8 train.py \
+    --init_ckpt logs/source/models/state_step001000.pt \
+    --num_iterations 200000
+```
+
 ### Initialize with Target Weight Norms
 
 The JSON file may include architecture metadata followed by the complete target
@@ -187,13 +200,24 @@ table. Each value is the norm of one whole tensor:
 The abbreviated table above is illustrative; the actual file must cover every
 unique trainable parameter. Do not add `lm_head.weight`, because it is tied to
 `transformer.wte.weight`. Target norms only apply to fresh initialization and
-cannot be combined with `--resume_ckpt`.
+cannot be combined with `--resume_ckpt`. When `--init_ckpt` is also provided,
+the checkpoint weights are loaded first and each tensor is then rescaled to its
+target norm.
 
 ```shell
 torchrun --standalone --nproc_per_node=8 train.py \
     --n_layer 12 \
     --n_head 4 \
     --n_embd 512 \
+    --target_norms configs/target_norms_512.json
+```
+
+To rescale checkpoint initialization weights while preserving each tensor's
+direction, combine the two fresh-initialization options:
+
+```shell
+torchrun --standalone --nproc_per_node=8 train.py \
+    --init_ckpt logs/source/models/state_step001000.pt \
     --target_norms configs/target_norms_512.json
 ```
 

@@ -182,7 +182,8 @@ def parse_args():
     parser.add_argument('--n_embd', type=int, default=768,
                         help='embedding dimension')
     parser.add_argument('--target_norms', type=str, default=None,
-                        help='optional JSON file containing initialization weight norms')
+                        help='optional JSON file of initialization weight norms, '
+                             'applied after --init_ckpt')
     
     # Evaluation and logging hyperparameters
     parser.add_argument('--val_loss_every', type=int, default=125,
@@ -210,9 +211,17 @@ def parse_args():
     parser.add_argument("--write_file", type=str, default="final_val_loss.txt",
                         help="File to show the final val loss")
     
-    # Resume training
-    parser.add_argument('--resume_ckpt', type=str, default=None,
-                        help='path to checkpoint to resume training from')
+    # Checkpoint initialization / resume
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        '--init_ckpt', type=str, default=None,
+        help='path to checkpoint whose model weights initialize a fresh run; '
+             'step and optimizer are ignored'
+    )
+    checkpoint_group.add_argument(
+        '--resume_ckpt', type=str, default=None,
+        help='path to checkpoint to resume training from'
+    )
     
     return parser.parse_args()
 
@@ -320,22 +329,33 @@ def main():
                 f"{len(target_weight_norms)} parameters from {args.target_norms}"
             )
 
-    model = GPT(model_config, target_weight_norms=target_weight_norms)
+    model = GPT(model_config)
     model = model.cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True # suggested by @Chillee
     model = torch.compile(model)
     
-    # Load model state from checkpoint early if resuming (before DDP and compile)
+    # Load model state from a checkpoint before DDP.
     start_step = 0
     ckpt_optimizers_state = None
-    if args.resume_ckpt:
+    if args.init_ckpt:
+        print(f"Loading initial model weights from checkpoint {args.init_ckpt}...")
+        ckpt = torch.load(args.init_ckpt, map_location='cpu')
+        model.load_state_dict(ckpt['model'])
+        print("Initialized model weights from checkpoint; starting a fresh run at step 0")
+    elif args.resume_ckpt:
         print(f"Loading model state from checkpoint {args.resume_ckpt}...")
         ckpt = torch.load(args.resume_ckpt, map_location='cpu')
         model.load_state_dict(ckpt['model'])
         start_step = ckpt.get('step', 0)
         ckpt_optimizers_state = ckpt.get('optimizers', None)
         print(f"Restored model state, resuming from step {start_step}")
+
+    # Apply requested target norms after standard or checkpoint initialization.
+    if target_weight_norms is not None:
+        model.set_weight_norms_(target_weight_norms)
+        if master_process:
+            print("Applied target initialization norms")
     
     # here we wrap model into DDP container
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -407,6 +427,7 @@ def main():
             'n_layer': args.n_layer,
             'n_head': args.n_head,
             'n_embd': args.n_embd,
+            'init_ckpt': args.init_ckpt,
             'target_norms': args.target_norms,
             'grad_clip': args.grad_clip,
         }
