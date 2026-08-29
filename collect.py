@@ -62,14 +62,14 @@ def main():
             print(f'Warning: {metrics_path} has no data rows, skipping', file=sys.stderr)
             continue
         header = lines[0]
-        rows.append([os.path.basename(d)] + lines[-1])
+        rows.append(lines[-1])
 
     if not rows:
         sys.exit('No metrics collected')
 
     with open(out_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['decay_run'] + header)
+        writer.writerow(header)
         writer.writerows(rows)
     print(f'Collected {len(rows)} decay runs into {out_path}')
 
