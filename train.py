@@ -7,6 +7,7 @@ import uuid
 import glob
 import time
 import re
+import math
 from dataclasses import dataclass
 from datetime import datetime
 import yaml
@@ -147,9 +148,18 @@ def parse_args():
     parser.add_argument('--num_iterations', type=int, default=2000,
                         help='number of iterations to run')
     parser.add_argument('--warmup_iters', type=int, default=250,
-                        help='number of warmup iterations')
+                        help='number of linear warmup iterations for every schedule')
     parser.add_argument('--warmdown_iters', type=int, default=1450,
-                        help='number of iterations of linear warmdown for triangular or trapezoidal schedule')
+                        help='number of iterations of linear warmdown for the WSD schedule')
+    parser.add_argument('--lr_schedule', type=str, default='wsd',
+                        choices=['wsd', 'cosine', 'sine', 'triangle'],
+                        help='learning rate schedule')
+    parser.add_argument('--final_lr', type=float, default=0.0,
+                        help='final learning rate for the cosine schedule')
+    parser.add_argument('--lr_amplitude', type=float, default=0.0,
+                        help='amplitude A for sine and triangle schedules')
+    parser.add_argument('--lr_period', type=int, default=1000,
+                        help='period T in iterations for sine and triangle schedules')
     parser.add_argument('--weight_decay', type=float, default=0,
                         help='weight decay')
 
@@ -379,24 +389,42 @@ def main():
             optimizers[i].load_state_dict(opt_state)
         print(f"Restored optimizer states for {len(optimizers)} optimizers")
     
-    # learning rate decay scheduler (linear warmup and warmdown)
+    # learning rate scheduler. The multiplier keeps optimizer-group LR ratios fixed.
     def get_lr(it):
         assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
             return (it + 1) / args.warmup_iters
-        # 2) constant lr for a while
-        elif it < args.num_iterations - args.warmdown_iters:
+
+        t = it - args.warmup_iters
+        if args.lr_schedule == 'cosine':
+            lr = args.final_lr + 0.5 * (args.optimizer_lr - args.final_lr) * (
+                1 + math.cos(
+                    math.pi * t / (args.num_iterations - args.warmup_iters)
+                )
+            )
+            return lr / args.optimizer_lr
+        elif args.lr_schedule == 'sine':
+            lr = args.optimizer_lr + args.lr_amplitude * math.sin(
+                2 * math.pi * (t + args.warmup_iters) / args.lr_period
+            )
+            return lr / args.optimizer_lr
+        elif args.lr_schedule == 'triangle':
+            triangle = (2 / math.pi) * math.asin(math.sin(
+                2 * math.pi * (t + args.warmup_iters) / args.lr_period
+            ))
+            lr = args.optimizer_lr + args.lr_amplitude * triangle
+            return lr / args.optimizer_lr
+
+        # WSD: stable LR followed by linear warmdown
+        if it < args.num_iterations - args.warmdown_iters:
             return 1.0
-        # 3) linear warmdown
         else:
             decay_ratio = (args.num_iterations - it) / args.warmdown_iters
             return decay_ratio
-    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-    if args.resume_ckpt and start_step > 0:
-        for scheduler in schedulers:
-            for _ in range(start_step):
-                scheduler.step()
+    schedulers = [
+        torch.optim.lr_scheduler.LambdaLR(opt, get_lr, last_epoch=start_step - 1)
+        for opt in optimizers
+    ]
 
     # begin logging
     run_id = None
@@ -417,6 +445,10 @@ def main():
             'num_iterations': args.num_iterations,
             'warmup_iters': args.warmup_iters,
             'warmdown_iters': args.warmdown_iters,
+            'lr_schedule': args.lr_schedule,
+            'final_lr': args.final_lr,
+            'lr_amplitude': args.lr_amplitude,
+            'lr_period': args.lr_period,
             'weight_decay': args.weight_decay,
             'optimizer_lr': args.optimizer_lr,
             'optimizer_mom': args.optimizer_mom,
@@ -442,7 +474,7 @@ def main():
             # include json columns for per-parameter norms
             writer.writerow([
                 'step', 'phase', 'train_loss', 'val_loss', 'total_ns_error',
-                'max_singular', 'min_singular', 'training_time_ms',
+                'max_singular', 'min_singular', 'avg_singular', 'training_time_ms',
                 'step_avg_time_ms', 'learning_rate',
                 'grad_norms_json', 'optimizer_norms_json', 'update_norms_json', 'weight_norms_json', 'correlations_json'
             ])
@@ -478,7 +510,7 @@ def main():
     torch.cuda.synchronize()
     t0 = time.time()
     # begin training
-    train_loader.reset(start_step=start_step)
+    train_loader.reset(start_step=start_step * train_accumulation_steps)
     x, y = train_loader.next_batch()
     # keep track of latest train stats so validation has something to record
     last_train_stats = None
@@ -525,7 +557,7 @@ def main():
                     max_s_val = float(optimizers[1].max_singular) if args.optimizer == "muon" else 0.0
                     min_s_val = float(optimizers[1].min_singular) if args.optimizer == "muon" else 0.0
                     avg_s_val = float(optimizers[1].avg_singular) if args.optimizer == "muon" else 0.0
-                    current_lr = get_lr(step) if step < args.num_iterations else 0
+                    current_lr = args.optimizer_lr * get_lr(step)
                     with open(metrics_csv, 'a', newline='') as csvf:
                         writer = csv.writer(csvf)
                         if last_train_stats is not None:
@@ -536,7 +568,7 @@ def main():
 
                 # Log to wandb
                 if args.use_wandb and WANDB_AVAILABLE:
-                    current_lr = get_lr(step) if step < args.num_iterations else 0
+                    current_lr = args.optimizer_lr * get_lr(step)
                     wandb.log({
                         "val_loss": val_loss.item(),
                         "step": step,

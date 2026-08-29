@@ -8,7 +8,7 @@ Training code for studying learning rate transfer in GPT-2 style models, with su
 ## Features
 
 - Three optimizer choices: `adam`, `muon`, `adamh`
-- WSD schedule
+- WSD, cosine, sine-wave, and triangle-wave learning rate schedules
 - Optional 2-power learning rate parametrization (`--use_power_learning_rate`)
 - Checkpointing with full training resumption (model + optimizer states)
 - CSV metrics logging (`metrics.csv`) as the primary source for data analysis, plus automatic loss curve plotting
@@ -65,15 +65,19 @@ torchrun --standalone --nproc_per_node=8 train.py
 | --- | --- | --- |
 | `--optimizer` | `muon` | Which optimizer to use: `adam`, `muon`, or `adamh` |
 | `--embed_lr` | `0.0036` | Learning rate for embedding / `lm_head` parameters |
-| `--optimizer_lr` | `0.02` | Learning rate for the main optimizer |
+| `--optimizer_lr` | `0.02` | Peak/base learning rate for the main optimizer |
 | `--optimizer_mom` | `0.95` | Momentum (or first beta) for the main optimizer |
 | `--use_power_learning_rate` | `False` | If set, the effective LR is `2 ** (-optimizer_lr)` |
 | `--batch_size` | `512` | Global batch size in sequences (across all devices) |
 | `--device_batch_size` | `64` | Per-device batch size in sequences |
 | `--sequence_length` | `1024` | Sequence length in tokens |
 | `--num_iterations` | `2000` | Total number of training iterations |
-| `--warmup_iters` | `250` | Number of linear warmup iterations |
-| `--warmdown_iters` | `1450` | Number of linear warmdown iterations (trapezoidal schedule) |
+| `--warmup_iters` | `250` | Number of linear warmup iterations for every schedule |
+| `--warmdown_iters` | `1450` | Number of linear warmdown iterations for WSD |
+| `--lr_schedule` | `wsd` | Schedule: `wsd`, `cosine`, `sine`, or `triangle` |
+| `--final_lr` | `0.0` | Final learning rate for the cosine schedule |
+| `--lr_amplitude` | `0.0` | Amplitude `A` for sine and triangle schedules |
+| `--lr_period` | `1000` | Period `T` in iterations for sine and triangle schedules |
 | `--weight_decay` | `0` | Weight decay coefficient |
 | `--grad_clip` | `1.0` | Gradient clipping value (0 disables clipping) |
 
@@ -118,6 +122,37 @@ torchrun --standalone --nproc_per_node=8 train.py
 
 ## Example Commands
 
+### Learning Rate Schedules
+
+All schedules begin with linear warmup for `warmup_iters`. In the formulas
+below, `t` counts optimizer steps after warmup:
+
+- `wsd`: stable peak LR followed by linear warmdown.
+- `cosine`: `final_lr + 0.5 * (optimizer_lr - final_lr) * (1 + cos(pi * t / (num_iterations - warmup_iters)))`.
+- `sine`: `optimizer_lr + lr_amplitude * sin(2 * pi * (t + warmup_iters) / lr_period)`.
+- `triangle`: `optimizer_lr + lr_amplitude * (2 / pi) * asin(sin(2 * pi * (t + warmup_iters) / lr_period))`.
+
+The resulting multiplier is also applied to the embedding optimizer, preserving
+the existing ratio between its learning rate and the main optimizer learning
+rate. `final_lr` and `lr_amplitude` are absolute learning rates, including when
+`--use_power_learning_rate` is used for `optimizer_lr`.
+
+```shell
+# Cosine from 0.02 to 0.001
+torchrun --standalone --nproc_per_node=8 train.py \
+    --lr_schedule cosine --optimizer_lr 0.02 --final_lr 0.001
+
+# Sine wave centered at 0.02, amplitude 0.005, period 1000 steps
+torchrun --standalone --nproc_per_node=8 train.py \
+    --lr_schedule sine --optimizer_lr 0.02 \
+    --lr_amplitude 0.005 --lr_period 1000
+
+# Triangle wave with the same center, amplitude, and period
+torchrun --standalone --nproc_per_node=8 train.py \
+    --lr_schedule triangle --optimizer_lr 0.02 \
+    --lr_amplitude 0.005 --lr_period 1000
+```
+
 
 ### Train with AdamW
 
@@ -160,9 +195,20 @@ torchrun --standalone --nproc_per_node=8 train.py \
 
 ### Resume from a Checkpoint
 
+The schedule and data loader resume at the checkpoint's saved global step.
+`--num_iterations` remains the final global step, not the number of additional
+steps. Repeat the original model, optimizer, batch/data, and schedule arguments,
+and use a new `--log_root` to preserve the source run:
+
 ```shell
 torchrun --standalone --nproc_per_node=8 train.py \
-    --resume_ckpt logs/20260101_120000/models/state_step001000.pt
+    --resume_ckpt ckpts/sine/models/state_step001000.pt \
+    --num_iterations 200000 \
+    --lr_schedule sine \
+    --optimizer_lr 0.02 \
+    --lr_amplitude 0.005 \
+    --lr_period 1000 \
+    --log_root ckpts/sine_resumed
 ```
 
 ### Initialize a Fresh Run from Checkpoint Weights
@@ -238,7 +284,7 @@ logs/
         └── ...
 ```
 
-The `metrics.csv` columns are: `step, phase, train_loss, val_loss, total_ns_error, max_singular, min_singular, training_time_ms, step_avg_time_ms, learning_rate, grad_norms_json, optimizer_norms_json, update_norms_json, weight_norms_json, correlations_json`.
+The `metrics.csv` columns are: `step, phase, train_loss, val_loss, total_ns_error, max_singular, min_singular, avg_singular, training_time_ms, step_avg_time_ms, learning_rate, grad_norms_json, optimizer_norms_json, update_norms_json, weight_norms_json, correlations_json`.
 
 The final validation loss is also appended to the file specified by `--write_file` (default `final_val_loss.txt`) along with the optimizer settings, making it easy to monitor the experiment.
 
