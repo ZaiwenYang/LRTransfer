@@ -74,20 +74,36 @@ class AdamH(AdamW):
             amsgrad=amsgrad,
             fused=fused,
         )
-        # Resolve sentinel and project all parameters onto the R-sphere so
-        # the invariant holds from step 0.
-        with torch.no_grad():
-            for group in self.param_groups:
-                for p in group["params"]:
-                    if group["radius"] < 0:     # sentinel → use init norm
-                        group["radius"] = p.data.norm().clamp(min=1e-12).item()
-                    R = group["radius"]
-                    p.data.mul_(R / p.data.norm().clamp(min=1e-12))
+
+    @torch.no_grad()
+    def _initialize_radii(self, group):
+        radii = []
+        for p in group["params"]:
+            current_norm = p.detach().norm().clamp(min=1e-12)
+            if group["radius"] < 0:
+                # The default radius belongs to the parameter, not the group.
+                radii.append(current_norm.item())
+            else:
+                radii.append(group["radius"])
+                p.mul_(group["radius"] / current_norm)
+        group["radii"] = radii
 
     def add_param_group(self, param_group):
         param_group.setdefault("radius",   getattr(self, "_adamh_radius",   -1.0))
         param_group.setdefault("norm_dim", getattr(self, "_adamh_norm_dim", None))
         super().add_param_group(param_group)
+        self._initialize_radii(self.param_groups[-1])
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            if "radii" not in group:
+                # Older checkpoints did not store per-parameter radii. The
+                # loaded parameters already lie on their intended spheres.
+                group["radii"] = [
+                    p.detach().norm().clamp(min=1e-12).item()
+                    for p in group["params"]
+                ]
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -106,10 +122,9 @@ class AdamH(AdamW):
         super().step()
 
         for group in self.param_groups:
-            lr     = group["lr"]
-            radius = group["radius"]
+            lr = group["lr"]
 
-            for p in group["params"]:
+            for p, radius in zip(group["params"], group["radii"]):
                 if p not in snapshots:
                     continue
 

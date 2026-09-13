@@ -637,15 +637,14 @@ def main():
         else:
             clip_norm = None
 
-        # Build parameter -> optimizer mapping for later norm computation
+        # Build parameter -> optimizer mapping and capture the LR that this
+        # optimizer step will use. sched.step() changes the group LR below.
         param_id_to_opt_info = {}
-        for opt_idx, opt in enumerate(optimizers):
+        for opt in optimizers:
             for param_group in opt.param_groups:
+                step_lr = param_group['lr']
                 for param in param_group['params']:
-                    param_id_to_opt_info[id(param)] = (opt_idx, opt, param_group)
-
-        # Get current learning rates before stepping
-        current_lrs = [sched.get_last_lr()[0] for sched in schedulers]
+                    param_id_to_opt_info[id(param)] = (param_group, step_lr)
 
         # capture parameter values before optimizer step for update norm
         old_params = {name: p.detach().clone() for name, p in model.named_parameters()}
@@ -670,8 +669,7 @@ def main():
                 # Therefore: u_t = -(w_{t+1} - w_t)/η - λw_t
                 param_id = id(p)
                 if param_id in param_id_to_opt_info:
-                    opt_idx, opt, param_group = param_id_to_opt_info[param_id]
-                    lr = param_group.get('lr', current_lrs[opt_idx])
+                    param_group, lr = param_id_to_opt_info[param_id]
                     weight_decay = param_group.get('weight_decay', 0)
                     
                     update = p.data - prev  # This is -η(u_t + λw_t)
