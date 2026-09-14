@@ -179,6 +179,8 @@ def parse_args():
                         help='number of attention heads')
     parser.add_argument('--n_embd', type=int, default=768,
                         help='embedding dimension')
+    parser.add_argument('--untie_embeddings', action='store_true',
+                        help='use separate token embedding and lm_head weights')
     parser.add_argument('--target_norms', type=str, default=None,
                         help='optional JSON file of initialization weight norms, '
                              'applied after --init_ckpt')
@@ -228,8 +230,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def embedding_and_lm_head_parameters(raw_model):
+    parameters = [raw_model.transformer.wte.weight]
+    if raw_model.lm_head.weight is not raw_model.transformer.wte.weight:
+        parameters.append(raw_model.lm_head.weight)
+    return parameters
+
+
 def custom_adam(args, raw_model, ddp_rank, ddp_world_size):
-    optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.embed_lr, betas=(0.9, 0.95),
+    optimizer1 = torch.optim.AdamW(embedding_and_lm_head_parameters(raw_model), lr=args.embed_lr, betas=(0.9, 0.95),
                                    weight_decay=args.weight_decay, fused=True)
     optimizer2 = torch.optim.AdamW(raw_model.transformer.h.parameters(), lr=args.optimizer_lr, betas=(args.optimizer_mom, 0.95),
                                    weight_decay=args.weight_decay, fused=True)
@@ -238,7 +247,7 @@ def custom_adam(args, raw_model, ddp_rank, ddp_world_size):
     return optimizers
 
 def custom_adamh(args, raw_model, ddp_rank, ddp_world_size):
-    optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.embed_lr, betas=(0.9, 0.95),
+    optimizer1 = torch.optim.AdamW(embedding_and_lm_head_parameters(raw_model), lr=args.embed_lr, betas=(0.9, 0.95),
                                    weight_decay=args.weight_decay, fused=True)
     optimizer2 = AdamH(
         raw_model.transformer.h.parameters(),
@@ -255,7 +264,7 @@ def custom_adamh(args, raw_model, ddp_rank, ddp_world_size):
 
 
 def custom_muon(args, raw_model, ddp_rank, ddp_world_size):
-    optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.optimizer_lr, betas=(0.9, 0.95),
+    optimizer1 = torch.optim.AdamW(embedding_and_lm_head_parameters(raw_model), lr=args.optimizer_lr, betas=(0.9, 0.95),
                                    weight_decay=args.weight_decay, fused=True)
     optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.optimizer_lr, momentum=args.optimizer_mom, backend=args.backend, backend_steps=args.backend_steps, layerwise_lr=args.layer_wise_lr,
                                     rank=ddp_rank, world_size=ddp_world_size)
@@ -320,7 +329,8 @@ def main():
         vocab_size=args.vocab_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
-        n_embd=args.n_embd
+        n_embd=args.n_embd,
+        tie_embeddings=not args.untie_embeddings,
     )
     target_weight_norms = None
     if args.target_norms is not None:
@@ -452,6 +462,7 @@ def main():
             'n_layer': args.n_layer,
             'n_head': args.n_head,
             'n_embd': args.n_embd,
+            'untie_embeddings': args.untie_embeddings,
             'init_ckpt': args.init_ckpt,
             'target_norms': args.target_norms,
             'grad_clip': args.grad_clip,

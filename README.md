@@ -97,6 +97,7 @@ torchrun --standalone --nproc_per_node=8 train.py
 | `--n_layer` | `12` | Number of transformer layers |
 | `--n_head` | `6` | Number of attention heads |
 | `--n_embd` | `768` | Embedding dimension |
+| `--untie_embeddings` | `False` | Give the token embedding and `lm_head` separate weights instead of sharing one tensor |
 | `--target_norms` | `None` | JSON file containing initialization weight norms; applied after `--init_ckpt` when both are provided |
 
 ### Evaluation & Logging
@@ -318,11 +319,12 @@ table. Each value is the norm of one whole tensor:
 ```
 
 The abbreviated table above is illustrative; the actual file must cover every
-unique trainable parameter. Do not add `lm_head.weight`, because it is tied to
-`transformer.wte.weight`. Target norms only apply to fresh initialization and
-cannot be combined with `--resume_ckpt`. When `--init_ckpt` is also provided,
-the checkpoint weights are loaded first and each tensor is then rescaled to its
-target norm.
+unique trainable parameter. By default, do not add `lm_head.weight`, because it
+is tied to `transformer.wte.weight`. With `--untie_embeddings`, both
+`transformer.wte.weight` and `lm_head.weight` are independent and must have
+entries. Target norms only apply to fresh initialization and cannot be combined
+with `--resume_ckpt`. When `--init_ckpt` is also provided, the checkpoint weights
+are loaded first and each tensor is then rescaled to its target norm.
 
 ```shell
 torchrun --standalone --nproc_per_node=8 train.py \

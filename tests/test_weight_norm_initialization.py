@@ -66,6 +66,27 @@ class WeightNormInitializationTests(unittest.TestCase):
 
         self.assertIs(model.transformer.wte.weight, model.lm_head.weight)
 
+    def test_model_can_use_separate_embedding_and_lm_head_weights(self):
+        config = GPTConfig(
+            vocab_size=16,
+            n_layer=2,
+            n_head=2,
+            n_embd=8,
+            tie_embeddings=False,
+        )
+        model = GPT(config)
+
+        self.assertIsNot(model.transformer.wte.weight, model.lm_head.weight)
+        self.assertNotEqual(
+            model.transformer.wte.weight.untyped_storage().data_ptr(),
+            model.lm_head.weight.untyped_storage().data_ptr(),
+        )
+
+        embedding_before = model.transformer.wte.weight.detach().clone()
+        with torch.no_grad():
+            model.lm_head.weight.zero_()
+        self.assertTrue(torch.equal(model.transformer.wte.weight, embedding_before))
+
     def test_model_rejects_incomplete_target_table(self):
         config = GPTConfig(vocab_size=16, n_layer=2, n_head=2, n_embd=8)
         with self.assertRaisesRegex(KeyError, "Missing target norms"):

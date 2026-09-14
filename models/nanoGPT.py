@@ -101,6 +101,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 
     n_embd : int = 768
+    tie_embeddings : bool = True
 
 class GPT(nn.Module):
 
@@ -113,7 +114,8 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight 
+        if config.tie_embeddings:
+            self.transformer.wte.weight = self.lm_head.weight
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
