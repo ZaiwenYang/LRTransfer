@@ -2,7 +2,7 @@
 
 Training code for studying learning rate transfer in GPT-2 style models, with support for multiple optimizers including AdamW, [Muon](https://kellerjordan.github.io/posts/muon/), and [AdamH](https://tinyurl.com/muonh). Built on top of the open-source [nanoGPT](https://github.com/karpathy/nanogpt) codebase.
 
-> **Note on Muon.** Our current work is **not** related to the [Muon optimizer](https://kellerjordan.github.io/posts/muon/). However, in the early stage of this project we explored Muon as well, and the corresponding code paths (the `muon` optimizer choice, all `--backend*` and `--layer_wise_lr` flags, and the Newton-Schulz error / singular-value diagnostics) have been left in the script for reference. They are **not used** in the experiments reported in our work, and can be safely ignored when reproducing our results.
+> **Note on Muon.** Our current work is **not** related to the [Muon optimizer](https://kellerjordan.github.io/posts/muon/). However, in the early stage of this project we explored Muon as well, and the corresponding code paths (the `muon` optimizer choice and all `--backend*` and `--layer_wise_lr` flags) have been left in the script for reference. They are **not used** in the experiments reported in our work, and can be safely ignored when reproducing our results.
  
 
 ## Features
@@ -12,7 +12,7 @@ Training code for studying learning rate transfer in GPT-2 style models, with su
 - Optional 2-power learning rate parametrization (`--use_power_learning_rate`)
 - Checkpointing with full training resumption (model + optimizer states)
 - CSV metrics logging (`metrics.csv`) as the primary source for data analysis, plus automatic loss curve plotting
-- Optional [Weights & Biases](https://wandb.ai/) integration  for live experiment monitoring
+- Optional [Weights & Biases](https://wandb.ai/) and [SwanLab](https://swanlab.cn/) experiment tracking
 
 ## Environment
 
@@ -106,15 +106,95 @@ torchrun --standalone --nproc_per_node=8 train.py
 | `--val_loss_every` | `100` | Run validation every N steps (`0` = only at the end) |
 | `--val_tokens` | `10485760` | Number of validation tokens per evaluation |
 | `--save_every` | `5000` | Checkpoint frequency in steps (`0` = only at the end) |
-| `--use_wandb` | `False` | Enable Weights & Biases Monitor. We often don't use wandb, as we collect more detailed data in a `metrics.csv`. |
+| `--use_wandb` | `False` | Enable W&B logging (flag; no value required) |
 | `--wandb_project` | `LRTransfer` | W&B project name |
-| `--wandb_run_name` | `gpt-2` | W&B run name (falls back to `run_id` if `None`) |
+| `--wandb_run_name` | `None` | W&B experiment name (defaults to `run_id`) |
+| `--wandb_mode` | `online` | W&B mode: `online`, `offline`, or `disabled` |
+| `--use_swanlab` | `False` | Enable SwanLab logging; can be used together with `--use_wandb` |
+| `--swanlab_project` | `LRTransfer` | SwanLab project name |
+| `--swanlab_run_name` | `None` | SwanLab experiment name (defaults to `run_id`) |
+| `--swanlab_mode` | `online` | SwanLab mode: `online`, `offline`, or `local` |
+
+Both integrations are opt-in: pass `--use_wandb` and/or `--use_swanlab` without
+a boolean value. Once enabled, both default to `online`. Log in with `wandb login`
+or `swanlab login` before online runs. Both SDKs are imported only when enabled
+on DDP rank 0; if an enabled SDK is missing, training exits with an import error.
+Both experiment names default to the same timestamp-based `run_id` and can be
+overridden with the corresponding `--*_run_name` argument.
+
+W&B logs are stored under `<log_root>/wandb` by default, and SwanLab logs under
+`<log_root>/swanlab`. Both are finalized before `--enable_backup` copies the entire
+log directory. Mode choices remain SDK-specific: W&B offers `disabled`, while
+SwanLab offers `local` for its optional dashboard.
+
+To use W&B offline:
+
+```shell
+torchrun --standalone --nproc_per_node=8 train.py --use_wandb --wandb_mode offline
+```
+
+### SwanLab
+
+SwanLab logs the same metrics as W&B, from DDP rank 0 only: training loss,
+per-parameter gradient/optimizer/update/weight norms, correlations, and gradient
+clipping norm on every training step; validation loss, learning rate, and timing
+at validation steps. All command-line arguments are saved as the experiment configuration.
+
+Two additional metrics are recorded for each parameter tensor after every optimizer
+step (the tensor is treated as one flattened vector for L2 norms):
+
+- `Approximate ELR/<parameter_name>`: `lr_t * optimizer_norm_t / ||w_t||_2`.
+  The denominator is the **pre-update** weight norm. `lr_t` is the actual learning
+  rate used by that parameter's optimizer group, captured before the scheduler
+  advances. `optimizer_norm_t` is the existing reconstructed optimizer-direction
+  norm, with decoupled weight decay removed. A zero LR gives zero Approximate ELR
+  for nonzero weights.
+- `Normalized Weight Change/<parameter_name>`:
+  `||w_{t+1} / ||w_{t+1}||_2 - w_t / ||w_t||_2||_2`.
+
+`Approximate ELR/average` and `Normalized Weight Change/average` are arithmetic
+means over parameter tensors, excluding parameters in `wte` and `lm_head` modules
+(including names prefixed by DDP or `torch.compile`). Each tensor has equal weight,
+regardless of its number of elements. Embedding parameters still have individual
+metrics; tied weights appear once, as in `model.named_parameters()`.
+
+A zero weight norm makes the corresponding normalized metric undefined, recorded
+as `NaN`; undefined values in included parameters propagate to the average. An empty
+set of eligible parameters also yields `NaN`. At step 0, no update metrics exist yet.
+W&B and SwanLab receive identical metrics; CSV stores these metrics at the existing
+validation logging frequency, using the latest completed optimizer update.
+
+```shell
+# Offline logging (no login required)
+torchrun --standalone --nproc_per_node=8 train.py \
+    --use_swanlab --swanlab_mode offline --swanlab_run_name adam-lr7 \
+    --optimizer adam --use_power_learning_rate --optimizer_lr 7 \
+    --log_root logs/adam-lr7
+
+# Online logging (default; log in once before launching training)
+swanlab login
+torchrun --standalone --nproc_per_node=8 train.py \
+    --use_swanlab \
+    --swanlab_project LRTransfer --swanlab_run_name gpt-2
+```
+
+SwanLab is included in `requirements.txt`; in an existing environment, install it
+with `pip install swanlab`. Logs are stored in `<log_root>/swanlab` and are included
+when `--enable_backup` copies the log directory. Training and validation metrics
+for the same completed step are submitted together, so each metric is logged only
+once per step. Restoring `--resume_ckpt` creates a new tracking experiment whose
+steps start at the restored checkpoint step.
+
+For the optional local dashboard, install `pip install 'swanlab[dashboard]'`,
+train with `--swanlab_mode local`, then run `swanlab watch <log_root>/swanlab`.
+The `offline` mode stores data for later synchronization; `local` also writes
+dashboard data. See the [SwanLab mode documentation](https://docs.swanlab.cn/api/py-init.html).
 
 ### Backup & Checkpoints
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `--enable_backup` | `False` | Copy logs and W&B run folder to `--backup_root` after training |
+| `--enable_backup` | `False` | Copy the log directory, including W&B and SwanLab data, to `--backup_root` after training |
 | `--backup_root` | `logs` | Destination root for backups |
 | `--write_file` | `final_val_loss.txt` | Append the final validation loss to this file |
 | `--init_ckpt` | `None` | Path to a `.pt` checkpoint used only for initial model weights; training starts fresh at step 0 |
@@ -284,7 +364,12 @@ logs/
         └── ...
 ```
 
-The `metrics.csv` columns are: `step, phase, train_loss, val_loss, total_ns_error, max_singular, min_singular, avg_singular, training_time_ms, step_avg_time_ms, learning_rate, grad_norms_json, optimizer_norms_json, update_norms_json, weight_norms_json, correlations_json`.
+The `metrics.csv` columns are: `step, phase, train_loss, val_loss, training_time_ms, step_avg_time_ms, learning_rate, grad_norms_json, optimizer_norms_json, update_norms_json, weight_norms_json, correlations_json`.
+
+The update metrics append four columns: `approximate_elrs_json`,
+`normalized_weight_changes_json`, `approximate_elr_average`, and
+`normalized_weight_change_average`. They are blank before the first optimizer
+update (including an evaluation immediately after restoring a checkpoint).
 
 The final validation loss is also appended to the file specified by `--write_file` (default `final_val_loss.txt`) along with the optimizer settings, making it easy to monitor the experiment.
 

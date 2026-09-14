@@ -32,16 +32,9 @@ from models.nanoGPT import GPT, GPTConfig
 from models.weight_norms import load_target_norms
 from optim.muon import Muon
 from optim.adamh import AdamH
+from training_metrics import parameter_average, parameter_update_metrics
 
 from tqdm import tqdm
-
-# Import wandb
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    print("Warning: wandb not available, logging will be limited to console/file")
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -205,17 +198,29 @@ def parse_args():
     parser.add_argument('--log_root', type=str, default='logs',
                         help='directory for run outputs (checkpoints go to <log_root>/models)')
     
-    # Wandb arguments
-    parser.add_argument('--use_wandb', type=bool, default=False,
-                        help='whether to use wandb for logging')
+    # W&B arguments
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='enable Weights & Biases experiment logging')
     parser.add_argument('--wandb_project', type=str, default='LRTransfer',
-                        help='wandb project name')
-    parser.add_argument('--wandb_run_name', type=str, default='gpt-2',
-                        help='wandb run name, if None will use the run_id')
+                        help='W&B project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='W&B experiment name, defaults to the run_id')
+    parser.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'],
+                        default='online', help='Weights & Biases logging mode')
+
+    # SwanLab arguments
+    parser.add_argument('--use_swanlab', action='store_true',
+                        help='enable SwanLab experiment logging')
+    parser.add_argument('--swanlab_project', type=str, default='LRTransfer',
+                        help='SwanLab project name')
+    parser.add_argument('--swanlab_run_name', type=str, default=None,
+                        help='SwanLab experiment name, defaults to the run_id')
+    parser.add_argument('--swanlab_mode', choices=['online', 'offline', 'local'],
+                        default='online', help='SwanLab logging mode')
 
     # Backup options
     parser.add_argument('--enable_backup', action='store_true',
-                        help='enable backup of logs and wandb run folder to backup_root')
+                        help='enable backup of logs, including W&B and SwanLab data, to backup_root')
     parser.add_argument('--backup_root', type=str, default='logs',
                         help='root folder to copy logs to when --enable_backup is set')
     parser.add_argument("--write_file", type=str, default="final_val_loss.txt",
@@ -430,6 +435,7 @@ def main():
     run_id = None
     logdir = None
     logfile = None
+    experiment_loggers = []
     if master_process:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         logdir = args.log_root
@@ -473,10 +479,11 @@ def main():
             writer = csv.writer(csvf)
             # include json columns for per-parameter norms
             writer.writerow([
-                'step', 'phase', 'train_loss', 'val_loss', 'total_ns_error',
-                'max_singular', 'min_singular', 'avg_singular', 'training_time_ms',
+                'step', 'phase', 'train_loss', 'val_loss', 'training_time_ms',
                 'step_avg_time_ms', 'learning_rate',
-                'grad_norms_json', 'optimizer_norms_json', 'update_norms_json', 'weight_norms_json', 'correlations_json'
+                'grad_norms_json', 'optimizer_norms_json', 'update_norms_json', 'weight_norms_json', 'correlations_json',
+                'approximate_elrs_json', 'normalized_weight_changes_json',
+                'approximate_elr_average', 'normalized_weight_change_average'
             ])
         # create the log file
         with open(logfile, "w") as f:
@@ -492,18 +499,33 @@ def main():
             f.write(f'{result.stdout}\n')
             f.write('='*100 + '\n')
 
-        # Initialize wandb
-        if args.use_wandb and WANDB_AVAILABLE:
-            wandb_run_name = args.wandb_run_name if args.wandb_run_name else str(run_id)
+        if args.use_wandb:
+            import wandb
+
+            wandb_run_name = args.wandb_run_name or str(run_id)
             wandb.init(
-                mode="offline",
                 project=args.wandb_project,
                 name=wandb_run_name,
-                config=vars(args)  # log all arguments
+                config=vars(args),
+                dir=logdir,  # W&B creates its own wandb subdirectory.
+                mode=args.wandb_mode,
             )
-            print(f"Initialized wandb project: {args.wandb_project}, run: {wandb_run_name}")
-        elif args.use_wandb and not WANDB_AVAILABLE:
-            print("Warning: wandb requested but not available")
+            experiment_loggers.append(wandb)
+            print(f"Initialized W&B project: {args.wandb_project}, run: {wandb_run_name}")
+
+        if args.use_swanlab:
+            import swanlab
+
+            swanlab_run_name = args.swanlab_run_name or str(run_id)
+            swanlab.init(
+                project=args.swanlab_project,
+                experiment_name=swanlab_run_name,
+                config=vars(args),
+                logdir=os.path.join(logdir, 'swanlab'),
+                mode=args.swanlab_mode,
+            )
+            experiment_loggers.append(swanlab)
+            print(f"Initialized SwanLab project: {args.swanlab_project}, run: {swanlab_run_name}")
 
     training_time_ms = 0
     # start the clock
@@ -514,6 +536,9 @@ def main():
     x, y = train_loader.next_batch()
     # keep track of latest train stats so validation has something to record
     last_train_stats = None
+    # Merge training and validation at the same completed step before logging.
+    # SwanLab accepts only one value per metric per step.
+    pending_metrics = {}
     for step in tqdm(range(start_step, args.num_iterations + 1), desc="Training Steps"):
         last_step = (step == args.num_iterations)
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -544,46 +569,55 @@ def main():
             # log val loss to console and to logfile
             if master_process:
                 step_avg = training_time_ms/(timed_steps-1) if timed_steps > 1 else 0
-                ns_err = optimizers[1].total_error if args.optimizer == "muon" else 0.0
-                print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} ns_error:{ns_err:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms')
+                print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms')
                 with open(logfile, "a") as f:
-                    f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} ns_error:{ns_err:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms\n')
+                    f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms\n')
                     # append to CSV metrics
                     try:
                         val_loss_val = float(val_loss.item()) if hasattr(val_loss, 'item') else float(val_loss)
                     except Exception:
                         val_loss_val = float(val_loss)
-                    tot_err_val = float(optimizers[1].total_error) if args.optimizer == "muon" else 0.0
-                    max_s_val = float(optimizers[1].max_singular) if args.optimizer == "muon" else 0.0
-                    min_s_val = float(optimizers[1].min_singular) if args.optimizer == "muon" else 0.0
-                    avg_s_val = float(optimizers[1].avg_singular) if args.optimizer == "muon" else 0.0
                     current_lr = args.optimizer_lr * get_lr(step)
                     with open(metrics_csv, 'a', newline='') as csvf:
                         writer = csv.writer(csvf)
                         if last_train_stats is not None:
-                            t_loss, t_grad, t_optimizer, t_update, t_weight, t_correlations = last_train_stats
-                            writer.writerow([step, 'val', t_loss, val_loss_val, tot_err_val, max_s_val, min_s_val, avg_s_val, training_time_ms, step_avg, current_lr, json.dumps(t_grad), json.dumps(t_optimizer), json.dumps(t_update), json.dumps(t_weight), json.dumps(t_correlations)])
+                            (
+                                t_loss, t_grad, t_optimizer, t_update, t_weight,
+                                t_correlations, t_approximate_elrs, t_normalized_changes,
+                                t_approximate_elr_average, t_normalized_change_average,
+                            ) = last_train_stats
+                            writer.writerow([
+                                step, 'val', t_loss, val_loss_val, training_time_ms,
+                                step_avg, current_lr, json.dumps(t_grad),
+                                json.dumps(t_optimizer), json.dumps(t_update),
+                                json.dumps(t_weight), json.dumps(t_correlations),
+                                json.dumps(t_approximate_elrs), json.dumps(t_normalized_changes),
+                                t_approximate_elr_average, t_normalized_change_average,
+                            ])
                         else:
-                            writer.writerow([step, 'val', '', val_loss_val, tot_err_val, max_s_val, min_s_val, avg_s_val, training_time_ms, step_avg, current_lr, '', '', '', '', ''])
+                            writer.writerow([
+                                step, 'val', '', val_loss_val, training_time_ms,
+                                step_avg, current_lr, '', '', '', '', '', '', '', '', '',
+                            ])
 
-                # Log to wandb
-                if args.use_wandb and WANDB_AVAILABLE:
+                if experiment_loggers:
                     current_lr = args.optimizer_lr * get_lr(step)
-                    wandb.log({
+                    pending_metrics.update({
                         "val_loss": val_loss.item(),
                         "step": step,
                         "training_time_ms": training_time_ms,
                         "step_avg_time_ms": step_avg,
                         "learning_rate": current_lr,
-                        "total_ns_error": tot_err_val,
-                        "max_singular": max_s_val,
-                        "min_singular": min_s_val,
-                        "avg_singular": avg_s_val
-                    }, step=step)
+                    })
                     
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.time()
+
+        if pending_metrics:
+            for logger in experiment_loggers:
+                logger.log(pending_metrics, step=step)
+            pending_metrics = {}
 
         if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
             # stop the clock
@@ -659,6 +693,8 @@ def main():
         optimizer_norms_per = {}
         weight_norms_per = {}
         correlations_per = {}
+        approximate_elrs_per = {}
+        normalized_weight_changes_per = {}
         for name, p in model.named_parameters():
             prev = old_params.get(name)
             if prev is not None:
@@ -668,6 +704,7 @@ def main():
                 # From update equation: w_{t+1} = w_t - η(u_t + λw_t)
                 # Therefore: u_t = -(w_{t+1} - w_t)/η - λw_t
                 param_id = id(p)
+                lr = 0.0
                 if param_id in param_id_to_opt_info:
                     param_group, lr = param_id_to_opt_info[param_id]
                     weight_decay = param_group.get('weight_decay', 0)
@@ -685,8 +722,18 @@ def main():
                             correlations_per[name] = correlation.item()
                         else:
                             correlations_per[name] = 0.0
+
+                # optimizer_norm is not reconstructed when LR is zero; ELR is zero.
+                approximate_elrs_per[name], normalized_weight_changes_per[name] = (
+                    parameter_update_metrics(
+                        prev, p.detach(), lr, optimizer_norms_per.get(name, 0.0)
+                    )
+                )
             
             weight_norms_per[name] = p.data.norm().item()
+
+        approximate_elr_average = parameter_average(approximate_elrs_per)
+        normalized_weight_change_average = parameter_average(normalized_weight_changes_per)
 
         # compute simple summaries for printing
         # e.g. number of tracked params of each type
@@ -704,6 +751,10 @@ def main():
             update_norms_per,
             weight_norms_per,
             correlations_per,
+            approximate_elrs_per,
+            normalized_weight_changes_per,
+            approximate_elr_average,
+            normalized_weight_change_average,
         )
 
         # null the gradients
@@ -721,60 +772,38 @@ def main():
             )
             if clip_norm is not None:
                 grad_info += f" clip_norm:{clip_norm:.4f}"
-            ns_err = optimizers[1].total_error if args.optimizer == 'muon' else 0.0
-            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} {grad_info} ns_error:{ns_err:.4f} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms")
-            # with open(logfile, "a") as f:
-            #     f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} ns_error:{optimizers[1].total_error if args.optimizer == "muon" else 0:.4f} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms\n")
-            
-            #     # append to CSV metrics
-            #     try:
-            #         train_loss_val = float(train_loss.item()) if hasattr(train_loss, 'item') else float(train_loss)
-            #     except Exception:
-            #         train_loss_val = float(train_loss)
-            #     tot_err_val = float(optimizers[1].total_error) if args.optimizer == "muon" else 0.0
-            #     max_s_val = float(optimizers[1].max_singular) if args.optimizer == "muon" else 0.0
-            #     min_s_val = float(optimizers[1].min_singular) if args.optimizer == "muon" else 0.0
-            #     avg_s_val = float(optimizers[1].avg_singular) if args.optimizer == "muon" else 0.0
-            #     current_lr = get_lr(step+1) if (step+1) < args.num_iterations else 0
-            #     with open(metrics_csv, 'a', newline='') as csvf:
-            #         writer = csv.writer(csvf)
-            #         # include norms JSON
-            #         writer.writerow([step+1, 'train', train_loss_val, '', tot_err_val, max_s_val, min_s_val, approx_time, step_avg, current_lr, json.dumps(grad_norms_per), json.dumps(update_norms_per), json.dumps(weight_norms_per)])
-            # Log training loss to wandb
-            if args.use_wandb and WANDB_AVAILABLE:
-                # Get total_error from Newton-Schulz optimizer (index 1 for ours, may not exist for others)
-                # log per-parameter norms to wandb using hierarchical keys
-                log_dict = {"train_loss": train_loss.item(), "step": step + 1}
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} {grad_info} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms")
+            # Flush these metrics at the next loop start, after any validation.
+            if experiment_loggers:
+                pending_metrics = {"train_loss": train_loss.item(), "step": step + 1}
                 for name, val in grad_norms_per.items():
-                    log_dict[f"grad_norm/{name}"] = val
+                    pending_metrics[f"grad_norm/{name}"] = val
                 for name, val in optimizer_norms_per.items():
-                    log_dict[f"optimizer_norm/{name}"] = val
+                    pending_metrics[f"optimizer_norm/{name}"] = val
                 for name, val in update_norms_per.items():
-                    log_dict[f"update_norm/{name}"] = val
+                    pending_metrics[f"update_norm/{name}"] = val
                 for name, val in weight_norms_per.items():
-                    log_dict[f"weight_norm/{name}"] = val
+                    pending_metrics[f"weight_norm/{name}"] = val
                 for name, val in correlations_per.items():
-                    log_dict[f"correlation/{name}"] = val
+                    pending_metrics[f"correlation/{name}"] = val
+                for name, val in approximate_elrs_per.items():
+                    pending_metrics[f"Approximate ELR/{name}"] = val
+                for name, val in normalized_weight_changes_per.items():
+                    pending_metrics[f"Normalized Weight Change/{name}"] = val
+                pending_metrics["Approximate ELR/average"] = approximate_elr_average
+                pending_metrics["Normalized Weight Change/average"] = normalized_weight_change_average
                 if clip_norm is not None:
-                    log_dict["clip_norm"] = clip_norm
-                wandb.log(log_dict, step=step + 1)
-                if args.optimizer == "muon":
-                    wandb.log({
-                        "total_ns_error": optimizers[1].total_error,
-                        "max_singular": optimizers[1].max_singular,
-                        "min_singular": optimizers[1].min_singular,
-                        "avg_singular": optimizers[1].avg_singular,
-                    }, step=step + 1)
+                    pending_metrics["clip_norm"] = clip_norm.item()
 
     if master_process:
         print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
         
-        # Finish wandb run
-        if args.use_wandb and WANDB_AVAILABLE:
-            wandb.finish()
+        # Flush experiment data before backing up the log directory.
+        for logger in experiment_loggers:
+            logger.finish()
 
         # -----------------------------------------------------------------
-        # Backup logs and wandb run folder to a centralized filesystem if requested
+        # Backup logs, including W&B and SwanLab data, if requested.
         # Ensure uniqueness by including hostname and timestamp so multi-node runs
         # don't overwrite each other's backups.
         # -----------------------------------------------------------------
@@ -799,25 +828,6 @@ def main():
                                 with open(logfile, 'a') as f:
                                     f.write(f'Warning: failed to backup logs to {dest}: {e}\n')
 
-                    # backup wandb run directory if wandb was used and run dir is available
-                    if args.use_wandb and WANDB_AVAILABLE:
-                        try:
-                            run_dir = wandb.run.dir if hasattr(wandb, 'run') and wandb.run is not None else None
-                            if run_dir and os.path.exists(run_dir):
-                                dest_w = os.path.join(backup_root, f'wandb_run_{run_id}_{hostname}_{ts}')
-                                try:
-                                    shutil.copytree(run_dir, dest_w, dirs_exist_ok=True)
-                                    print(f'Backed up wandb run folder to {dest_w}')
-                                    if logfile:
-                                        with open(logfile, 'a') as f:
-                                            f.write(f'Backed up wandb run folder to {dest_w}\n')
-                                except Exception as e:
-                                    print(f'Warning: failed to backup wandb run folder to {dest_w}: {e}')
-                                    if logfile:
-                                        with open(logfile, 'a') as f:
-                                            f.write(f'Warning: failed to backup wandb run folder to {dest_w}: {e}\n')
-                        except Exception as e:
-                            print(f'Warning: error while locating wandb.run.dir: {e}')
                 else:
                     print(f'Backup destination {backup_root} does not exist, skipping backup')
             else:
@@ -854,7 +864,6 @@ def main():
         try:
             steps_train, loss_train = [], []
             steps_val, loss_val = [], []
-            steps_err, err_vals = [], []
             with open(metrics_csv, 'r') as csvf:
                 reader = csv.DictReader(csvf)
                 for row in reader:
@@ -868,15 +877,6 @@ def main():
                         if row.get('val_loss', '') != '':
                             steps_val.append(step)
                             loss_val.append(float(row['val_loss']))
-                    # ns error may appear in either row
-                    if row.get('total_ns_error', '') not in (None, ''):
-                        try:
-                            err = float(row['total_ns_error'])
-                            if step is not None:
-                                steps_err.append(step)
-                                err_vals.append(err)
-                        except Exception:
-                            pass
 
             # plot losses
             if loss_train or loss_val:
@@ -893,57 +893,6 @@ def main():
                 plt.savefig(os.path.join(logdir, 'losses.png'))
                 plt.close()
 
-            # # plot ns_error
-            # if err_vals:
-            #     plt.figure()
-            #     plt.plot(steps_err, err_vals, label='total_ns_error')
-            #     plt.xlabel('step')
-            #     plt.ylabel('ns_error')
-            #     plt.legend()
-            #     plt.grid(True)
-            #     plt.tight_layout()
-            #     plt.savefig(os.path.join(logdir, 'ns_error.png'))
-            #     plt.close()
-
-            # plot singular values (max and min)
-            # try:
-            #     steps_max, max_vals = [], []
-            #     steps_min, min_vals = [], []
-            #     with open(metrics_csv, 'r') as csvf:
-            #         reader = csv.DictReader(csvf)
-            #         for row in reader:
-            #             step = int(row.get('step', 0)) if row.get('step', '') != '' else None
-            #             if row.get('max_singular', '') not in (None, '') and step is not None:
-            #                 try:
-            #                     mv = float(row['max_singular'])
-            #                     steps_max.append(step)
-            #                     max_vals.append(mv)
-            #                 except Exception:
-            #                     pass
-            #             if row.get('min_singular', '') not in (None, '') and step is not None:
-            #                 try:
-            #                     mv = float(row['min_singular'])
-            #                     steps_min.append(step)
-            #                     min_vals.append(mv)
-            #                 except Exception:
-            #                     pass
-
-            #     if max_vals or min_vals:
-            #         plt.figure()
-            #         if max_vals:
-            #             plt.plot(steps_max, max_vals, label='max_singular')
-            #         if min_vals:
-            #             plt.plot(steps_min, min_vals, label='min_singular')
-            #         plt.xlabel('step')
-            #         plt.ylabel('singular value')
-            #         plt.legend()
-            #         plt.grid(True)
-            #         plt.tight_layout()
-            #         plt.savefig(os.path.join(logdir, 'singular_values.png'))
-            #         plt.close()
-            # except Exception:
-            #     # don't fail the whole plotting pipeline for singular value parse errors
-            #     pass
         except Exception as e:
             print(f"Warning: failed to generate plots: {e}")
 
