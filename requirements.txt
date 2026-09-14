@@ -6,6 +6,5 @@ tqdm
 triton==3.3.1
 wandb
 swanlab
-matplotlib
 datasets
 tiktoken

@@ -11,7 +11,7 @@ Training code for studying learning rate transfer in GPT-2 style models, with su
 - WSD, cosine, sine-wave, and triangle-wave learning rate schedules
 - Optional 2-power learning rate parametrization (`--use_power_learning_rate`)
 - Checkpointing with full training resumption (model + optimizer states)
-- CSV metrics logging (`metrics.csv`) as the primary source for data analysis, plus automatic loss curve plotting
+- CSV metrics logging (`metrics.csv`) as the primary source for data analysis
 - Optional [Weights & Biases](https://wandb.ai/) and [SwanLab](https://swanlab.cn/) experiment tracking
 
 ## Environment
@@ -123,8 +123,8 @@ Both experiment names default to the same timestamp-based `run_id` and can be
 overridden with the corresponding `--*_run_name` argument.
 
 W&B logs are stored under `<log_root>/wandb` by default, and SwanLab logs under
-`<log_root>/swanlab`. Both are finalized before `--enable_backup` copies the entire
-log directory. Mode choices remain SDK-specific: W&B offers `disabled`, while
+`<log_root>/swanlab`. Both are finalized at the end of training.
+Mode choices remain SDK-specific: W&B offers `disabled`, while
 SwanLab offers `local` for its optional dashboard.
 
 To use W&B offline:
@@ -179,8 +179,7 @@ torchrun --standalone --nproc_per_node=8 train.py \
 ```
 
 SwanLab is included in `requirements.txt`; in an existing environment, install it
-with `pip install swanlab`. Logs are stored in `<log_root>/swanlab` and are included
-when `--enable_backup` copies the log directory. Training and validation metrics
+with `pip install swanlab`. Logs are stored in `<log_root>/swanlab`. Training and validation metrics
 for the same completed step are submitted together, so each metric is logged only
 once per step. Restoring `--resume_ckpt` creates a new tracking experiment whose
 steps start at the restored checkpoint step.
@@ -190,13 +189,10 @@ train with `--swanlab_mode local`, then run `swanlab watch <log_root>/swanlab`.
 The `offline` mode stores data for later synchronization; `local` also writes
 dashboard data. See the [SwanLab mode documentation](https://docs.swanlab.cn/api/py-init.html).
 
-### Backup & Checkpoints
+### Checkpoints
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `--enable_backup` | `False` | Copy the log directory, including W&B and SwanLab data, to `--backup_root` after training |
-| `--backup_root` | `logs` | Destination root for backups |
-| `--write_file` | `final_val_loss.txt` | Append the final validation loss to this file |
 | `--init_ckpt` | `None` | Path to a `.pt` checkpoint used only for initial model weights; training starts fresh at step 0 |
 | `--resume_ckpt` | `None` | Path to a `.pt` checkpoint to resume from (restores model, optimizers, and step) |
 
@@ -250,8 +246,7 @@ torchrun --standalone --nproc_per_node=8 train.py \
     --val_loss_every 100 \
     --warmup_iters 1000 \
     --warmdown_iters 5000 \
-    --save_every 5000 \
-    --write_file final_val_loss.txt
+    --save_every 5000
 ```
 
 ### Train with AdamH
@@ -269,8 +264,7 @@ torchrun --standalone --nproc_per_node=8 train.py \
     --val_loss_every 100 \
     --warmup_iters 1000 \
     --warmdown_iters 5000 \
-    --save_every 5000 \
-    --write_file final_val_loss.txt
+    --save_every 5000
 ```
 
 ### Resume from a Checkpoint
@@ -357,7 +351,6 @@ logs/
     ├── config.yaml               # all hyperparameters used
     ├── logs.txt                  # full source code dump + nvidia-smi + step-by-step log
     ├── metrics.csv               # per-step metrics (train/val loss, norms, LR, etc.)
-    ├── losses.png                # train/val loss curves (auto-generated at the end)
     └── models/
         ├── state_step000250.pt
         ├── state_step000500.pt
@@ -370,8 +363,6 @@ The update metrics append four columns: `approximate_elrs_json`,
 `normalized_weight_changes_json`, `approximate_elr_average`, and
 `normalized_weight_change_average`. They are blank before the first optimizer
 update (including an evaluation immediately after restoring a checkpoint).
-
-The final validation loss is also appended to the file specified by `--write_file` (default `final_val_loss.txt`) along with the optimizer settings, making it easy to monitor the experiment.
 
 ## Acknowledgments
 

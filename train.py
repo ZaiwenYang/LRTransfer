@@ -21,11 +21,6 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import csv
 import json
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import shutil
-import socket
 
 # Import our modules
 from models.nanoGPT import GPT, GPTConfig
@@ -218,14 +213,6 @@ def parse_args():
     parser.add_argument('--swanlab_mode', choices=['online', 'offline', 'local'],
                         default='online', help='SwanLab logging mode')
 
-    # Backup options
-    parser.add_argument('--enable_backup', action='store_true',
-                        help='enable backup of logs, including W&B and SwanLab data, to backup_root')
-    parser.add_argument('--backup_root', type=str, default='logs',
-                        help='root folder to copy logs to when --enable_backup is set')
-    parser.add_argument("--write_file", type=str, default="final_val_loss.txt",
-                        help="File to show the final val loss")
-    
     # Checkpoint initialization / resume
     checkpoint_group = parser.add_mutually_exclusive_group()
     checkpoint_group.add_argument(
@@ -798,103 +785,9 @@ def main():
     if master_process:
         print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
         
-        # Flush experiment data before backing up the log directory.
+        # Finish experiment logging before distributed cleanup.
         for logger in experiment_loggers:
             logger.finish()
-
-        # -----------------------------------------------------------------
-        # Backup logs, including W&B and SwanLab data, if requested.
-        # Ensure uniqueness by including hostname and timestamp so multi-node runs
-        # don't overwrite each other's backups.
-        # -----------------------------------------------------------------
-        try:
-            backup_root = args.backup_root
-            if args.enable_backup:
-                if os.path.exists(backup_root):
-                    hostname = socket.gethostname()
-                    ts = int(time.time())
-                    # backup the local logdir (created earlier)
-                    if logdir and os.path.exists(logdir):
-                        dest = os.path.join(backup_root, f"{run_id}_{hostname}_{ts}")
-                        try:
-                            shutil.copytree(logdir, dest, dirs_exist_ok=True)
-                            print(f'Backed up logs to {dest}')
-                            if logfile:
-                                with open(logfile, 'a') as f:
-                                    f.write(f'Backed up logs to {dest}\n')
-                        except Exception as e:
-                            print(f'Warning: failed to backup logs to {dest}: {e}')
-                            if logfile:
-                                with open(logfile, 'a') as f:
-                                    f.write(f'Warning: failed to backup logs to {dest}: {e}\n')
-
-                else:
-                    print(f'Backup destination {backup_root} does not exist, skipping backup')
-            else:
-                print('Backup not enabled (use --enable_backup)')
-        except Exception as e:
-            print(f'Warning: backup step failed: {e}')
-            if logfile:
-                with open(logfile, 'a') as f:
-                    f.write(f'Warning: backup step failed: {e}\n')
-        try:
-            output_file = args.write_file
-
-            # Ensure file exists; if not, create an empty one
-            if not os.path.exists(output_file):
-                with open(output_file, "w") as f:
-                    pass  # just create empty file
-
-            # Append rather than overwrite
-            with open(output_file, "a") as f:
-                f.write("\n")  # separate from previous content
-                f.write("==== New Training Run ====\n")
-                f.write(f"optimizer_type: {args.optimizer}\n")
-                f.write(f"optimizer_lr: {args.optimizer_lr}\n")
-                f.write(f"optimizer_mom: {args.optimizer_mom}\n")
-                f.write(f"n_embd: {args.n_embd}\n")
-                f.write(f"final_val_loss: {val_loss.item() if hasattr(val_loss, 'item') else float(val_loss)}\n")
-
-            print(f"Appended final metrics to {output_file}")
-
-        except Exception as e:
-            print(f"Warning: failed to write data.txt: {e}")
-
-        # Generate plots from metrics.csv (if present)
-        try:
-            steps_train, loss_train = [], []
-            steps_val, loss_val = [], []
-            with open(metrics_csv, 'r') as csvf:
-                reader = csv.DictReader(csvf)
-                for row in reader:
-                    phase = row.get('phase', '')
-                    step = int(row.get('step', 0)) if row.get('step', '') != '' else None
-                    if phase == 'train':
-                        if row.get('train_loss', '') != '':
-                            steps_train.append(step)
-                            loss_train.append(float(row['train_loss']))
-                    elif phase == 'val':
-                        if row.get('val_loss', '') != '':
-                            steps_val.append(step)
-                            loss_val.append(float(row['val_loss']))
-
-            # plot losses
-            if loss_train or loss_val:
-                plt.figure()
-                if loss_train:
-                    plt.plot(steps_train, loss_train, label='train_loss')
-                if loss_val:
-                    plt.plot(steps_val, loss_val, label='val_loss')
-                plt.xlabel('step')
-                plt.ylabel('loss')
-                plt.legend()
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(os.path.join(logdir, 'losses.png'))
-                plt.close()
-
-        except Exception as e:
-            print(f"Warning: failed to generate plots: {e}")
 
     # -------------------------------------------------------------------------
     # clean up nice

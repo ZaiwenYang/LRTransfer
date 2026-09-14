@@ -56,5 +56,4 @@ torchrun --standalone --nproc_per_node="${NUM_GPUS}" "${SCRIPT_DIR}/train.py" \
     --warmup_iters 1000 \
     --warmdown_iters 1000 \
     --save_every 5000 \
-    --log_root "${CKPT_ROOT}" \
-    --write_file data.txt
+    --log_root "${CKPT_ROOT}"
